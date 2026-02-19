@@ -1,12 +1,21 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useCallback } from "react";
 import { ApiKeyInput } from "./ApiKeyInput";
 import { ProviderSelect } from "./ProviderSelect";
 import { ProgressStream } from "./ProgressStream";
 import type { LLMProvider } from "@/types";
 
-type GenerationState = "idle" | "scraping" | "generating" | "done" | "error";
+type GenerationState = "idle" | "generating" | "done" | "error";
+
+interface StepInfo {
+  step: number;
+  message: string;
+}
+
+// Regex to detect progress markers: __STEP:1:message__ or __ERROR:message__
+const STEP_PATTERN = /__STEP:(\d+):(.+?)__\n?/g;
+const ERROR_PATTERN = /__ERROR:(.+?)__\n?/g;
 
 export function GeneratorForm() {
   const [url, setUrl] = useState("");
@@ -15,16 +24,49 @@ export function GeneratorForm() {
   const [state, setState] = useState<GenerationState>("idle");
   const [streamedHtml, setStreamedHtml] = useState("");
   const [error, setError] = useState("");
+  const [currentStep, setCurrentStep] = useState<StepInfo | null>(null);
+  const [stepMessage, setStepMessage] = useState("");
   const abortRef = useRef<AbortController | null>(null);
 
-  const isLoading = state === "scraping" || state === "generating";
+  const isLoading = state === "generating";
+
+  const parseStreamChunk = useCallback(
+    (raw: string): string => {
+      // Extract and remove step markers
+      let cleaned = raw;
+
+      // Process step markers
+      let match;
+      const stepRegex = /__STEP:(\d+):(.+?)__\n?/g;
+      while ((match = stepRegex.exec(raw)) !== null) {
+        const stepNum = parseInt(match[1], 10);
+        const msg = match[2];
+        setCurrentStep({ step: stepNum, message: msg });
+        setStepMessage(msg);
+      }
+      cleaned = cleaned.replace(STEP_PATTERN, "");
+
+      // Process error markers
+      const errorRegex = /__ERROR:(.+?)__\n?/g;
+      while ((match = errorRegex.exec(raw)) !== null) {
+        setError(match[1]);
+        setState("error");
+      }
+      cleaned = cleaned.replace(ERROR_PATTERN, "");
+
+      return cleaned;
+    },
+    []
+  );
 
   async function handleGenerate() {
     if (!url || !apiKey) return;
 
     setError("");
     setStreamedHtml("");
-    setState("scraping");
+    setCurrentStep(null);
+    setStepMessage("");
+    setState("generating");
 
     abortRef.current = new AbortController();
 
@@ -41,23 +83,39 @@ export function GeneratorForm() {
         throw new Error(err.error || "Generation failed");
       }
 
-      setState("generating");
-
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
-      let accumulated = "";
+      let rawAccumulated = "";
+      let htmlAccumulated = "";
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        accumulated += decoder.decode(value, { stream: true });
-        setStreamedHtml(accumulated);
+
+        rawAccumulated += decoder.decode(value, { stream: true });
+
+        // Parse the full accumulated stream each time to extract markers
+        htmlAccumulated = parseStreamChunk(rawAccumulated);
+        setStreamedHtml(htmlAccumulated);
       }
 
-      setState("done");
+      // Final parse
+      htmlAccumulated = parseStreamChunk(rawAccumulated);
+      setStreamedHtml(htmlAccumulated);
+
+      if (state !== "error" && htmlAccumulated.trim().length > 0) {
+        setState("done");
+      } else if (htmlAccumulated.trim().length === 0 && !error) {
+        setError("No presentation was generated. The LLM returned empty content.");
+        setState("error");
+      }
     } catch (err: unknown) {
-      if (err instanceof Error && err.name === "AbortError") return;
-      const message = err instanceof Error ? err.message : "Generation failed";
+      if (err instanceof Error && err.name === "AbortError") {
+        setState("idle");
+        return;
+      }
+      const message =
+        err instanceof Error ? err.message : "Generation failed";
       setError(message);
       setState("error");
     }
@@ -66,6 +124,8 @@ export function GeneratorForm() {
   function handleCancel() {
     abortRef.current?.abort();
     setState("idle");
+    setCurrentStep(null);
+    setStepMessage("");
   }
 
   function handleDownload() {
@@ -90,6 +150,8 @@ export function GeneratorForm() {
     setState("idle");
     setStreamedHtml("");
     setError("");
+    setCurrentStep(null);
+    setStepMessage("");
   }
 
   return (
@@ -166,7 +228,8 @@ export function GeneratorForm() {
       {/* Progress */}
       {isLoading && (
         <ProgressStream
-          state={state as "scraping" | "generating"}
+          currentStep={currentStep}
+          stepMessage={stepMessage}
           htmlLength={streamedHtml.length}
         />
       )}
@@ -176,13 +239,20 @@ export function GeneratorForm() {
         <div className="p-4 bg-red-50 text-red-700 rounded-lg text-sm border border-red-100">
           <p className="font-medium">Generation failed</p>
           <p className="mt-1 text-red-600">{error}</p>
+          <button
+            onClick={handleReset}
+            className="mt-2 text-xs font-medium text-red-800 underline cursor-pointer"
+          >
+            Try again
+          </button>
         </div>
       )}
 
       {/* File size indicator when done */}
       {state === "done" && (
         <p className="text-center text-xs text-gray-400">
-          Generated {(streamedHtml.length / 1024).toFixed(1)} KB presentation
+          Generated {(streamedHtml.length / 1024).toFixed(1)} KB presentation in
+          3 steps
         </p>
       )}
     </div>
